@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+# Generated at install time, not source.
+widget.ico
+
+# Never commit probe output: the raw response contains your own usage and spend
+# figures, and field names for features that are not public yet.
+*probe*.json
