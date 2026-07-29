@@ -921,6 +921,7 @@ class WindowsTray:
         self.on_quit = on_quit
         self.hwnd = None
         self.available = False
+        self._show_message = 0  # set once the window class is registered
         self._ready = threading.Event()
         self._tip_lock = threading.Lock()
         self._pending_tip = tooltip
@@ -1031,6 +1032,13 @@ class WindowsTray:
             ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT
         ]
         self._user32.GetMessageW.restype = ctypes.c_int
+        self._user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+        self._user32.RegisterWindowMessageW.restype = wintypes.UINT
+
+        # A second launch broadcasts this to ask us to unhide. Registered names
+        # resolve to the same message id in every process, so it crosses the
+        # process boundary without us needing to know the other one's HWND.
+        self._show_message = self._user32.RegisterWindowMessageW(SHOW_MESSAGE_NAME)
 
         # Keep a reference or ctypes will collect the callback mid-flight.
         self._wndproc = WNDPROC(self._on_message)
@@ -1093,6 +1101,9 @@ class WindowsTray:
     # -- window procedure -------------------------------------------------
     def _on_message(self, hwnd, msg, wparam, lparam):
         try:
+            if self._show_message and msg == self._show_message:
+                self.on_restore()
+                return 0
             if msg == WM_TRAY_CALLBACK:
                 event = lparam & 0xFFFF
                 if event in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
@@ -1164,6 +1175,96 @@ class WindowsTray:
 
 
 # --------------------------------------------------------------------------
+# single instance
+#
+# Multiple copies each poll independently, multiplying the request rate against
+# an endpoint that rate limits hard - so a second launch should surface the
+# instance that already exists rather than add another poller.
+#
+# Windows uses a named mutex, and asks the running copy to show itself with a
+# registered broadcast message. Elsewhere we take an flock on a lock file; there
+# is no portable way to signal the other process, but on those platforms the
+# widget never hides itself (no tray, so minimize only collapses), which means
+# the existing window is already on screen.
+# --------------------------------------------------------------------------
+
+MUTEX_NAME = "Local\\ClaudeUsageWidget.SingleInstance"
+SHOW_MESSAGE_NAME = "ClaudeUsageWidget.Show"
+LOCK_PATH = Path.home() / ".claude-usage-widget.lock"
+HWND_BROADCAST = 0xFFFF
+ERROR_ALREADY_EXISTS = 183
+
+
+class SingleInstance:
+    def __init__(self) -> None:
+        self._handle = None   # Windows: mutex handle, held for process lifetime
+        self._file = None     # POSIX: open lock file, ditto
+
+    def acquire(self) -> bool:
+        """True if we are the only instance. Keeps the lock for our lifetime."""
+        if platform.system() == "Windows":
+            return self._acquire_mutex()
+        return self._acquire_flock()
+
+    def _acquire_mutex(self) -> bool:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.argtypes = [
+                wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR
+            ]
+            kernel32.CreateMutexW.restype = wintypes.HANDLE
+            handle = kernel32.CreateMutexW(None, True, MUTEX_NAME)
+            if not handle:
+                return True  # can't tell, so don't block the user
+            if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+                return False
+            self._handle = handle
+            return True
+        except Exception:
+            return True
+
+    def _acquire_flock(self) -> bool:
+        try:
+            import fcntl
+        except ImportError:
+            return True
+        try:
+            handle = open(LOCK_PATH, "w", encoding="utf-8")
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        except Exception:
+            return True
+        handle.write(str(os.getpid()))
+        handle.flush()
+        self._file = handle
+        return True
+
+    def signal_existing(self) -> None:
+        """Best effort: ask the running instance to unhide itself."""
+        if platform.system() != "Windows":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+            user32.RegisterWindowMessageW.restype = wintypes.UINT
+            user32.PostMessageW.argtypes = [
+                wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+            ]
+            message = user32.RegisterWindowMessageW(SHOW_MESSAGE_NAME)
+            if message:
+                user32.PostMessageW(HWND_BROADCAST, message, 0, 0)
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
 # entry points
 # --------------------------------------------------------------------------
 
@@ -1213,6 +1314,15 @@ def main() -> int:
         print("tkinter is not available. On Debian/Ubuntu: sudo apt install "
               "python3-tk", file=sys.stderr)
         return 1
+
+    # Held for the process lifetime; releasing it early would let a second
+    # instance start while this one is still running.
+    guard = SingleInstance()
+    if "--allow-multiple" not in sys.argv and not guard.acquire():
+        guard.signal_existing()
+        print("Claude usage widget is already running - asked it to show itself.")
+        return 0
+
     root = tk.Tk()
     root.minsize(Widget.WIDTH, 1)
     root.maxsize(Widget.WIDTH, 10_000)  # fixed width, content-driven height

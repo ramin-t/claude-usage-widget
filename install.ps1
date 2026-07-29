@@ -75,17 +75,32 @@ if ($Uninstall) {
 
 # ------------------------------------------------------------ find python
 # pythonw.exe is the console-less launcher, so the widget shows no black window.
+#
+# Prefer the real interpreter path over a Microsoft Store app-execution alias
+# (...\WindowsApps\python*.exe). The alias works interactively but is a poor
+# shortcut target: it can be turned off in Settings, and it resolves per-user in
+# ways that are unreliable for something launched at login. Asking the
+# interpreter for its own sys.executable gets us the concrete path.
+$Python = $null
 $PythonW = $null
 try {
-    $PythonW = (Get-Command pythonw.exe -ErrorAction Stop).Source
+    $Python = (Get-Command python.exe -ErrorAction Stop).Source
+    $real = (& $Python -c "import sys; print(sys.executable)" 2>$null | Select-Object -First 1)
+    if ($real -and (Test-Path $real)) { $Python = $real }
 } catch {
-    try {
-        $sibling = Join-Path (Split-Path (Get-Command python.exe -ErrorAction Stop).Source) 'pythonw.exe'
-        if (Test-Path $sibling) { $PythonW = $sibling }
-    } catch {
-        $PythonW = $null
-    }
+    $Python = $null
 }
+
+if ($Python) {
+    $candidate = Join-Path (Split-Path $Python) 'pythonw.exe'
+    if (Test-Path $candidate) { $PythonW = $candidate }
+}
+
+if (-not $PythonW) {
+    # Fall back to whatever pythonw is on PATH, alias or not.
+    try { $PythonW = (Get-Command pythonw.exe -ErrorAction Stop).Source } catch { $PythonW = $null }
+}
+if (-not $Python -and $PythonW) { $Python = $PythonW }
 
 if (-not $PythonW) {
     Write-Host @"
@@ -103,11 +118,12 @@ Make sure "Add python.exe to PATH" is checked, then re-run this installer.
 }
 
 # tkinter ships with the python.org installer but can be absent in trimmed builds.
-& $PythonW -c "import tkinter" 2>$null
+# Check with python.exe rather than pythonw.exe, which has no console to report on.
+& $Python -c "import tkinter" 2>$null
 if ($LASTEXITCODE -ne 0) {
     Write-Host @"
 
-Found Python at $PythonW, but it has no tkinter module.
+Found Python at $Python, but it has no tkinter module.
 
 The widget draws its window with tkinter. Reinstall Python from
 https://www.python.org/downloads/ with the "tcl/tk and IDLE" option enabled.
@@ -133,7 +149,7 @@ Write-Step "installed to $InstallTo"
 
 $target = Join-Path $InstallTo $ScriptName
 $icon = Join-Path $InstallTo 'widget.ico'
-& $PythonW $target --make-icon $icon | Out-Null
+& $Python $target --make-icon $icon | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Step 'icon generation failed; using default icon' }
 
 function New-WidgetShortcut($Path, $Label, $ExtraArgs = '') {

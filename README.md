@@ -74,6 +74,22 @@ window.
 With `-Startup`, login launches it straight into the tray. Pass
 `-StartupVisible` alongside it if you'd rather see the window at login.
 
+### One instance only
+
+Launching the widget when it is already running does not start a second copy —
+it brings the existing one back into view and exits. This matters more than it
+sounds: each instance polls independently, so N copies means N times the request
+rate against an endpoint that rate limits hard.
+
+Windows uses a named mutex plus a registered broadcast message to signal the
+running copy. Other platforms take an `flock` on `~/.claude-usage-widget.lock`;
+there is no portable way to signal the other process, but those platforms have no
+tray, so the widget never hides itself and the existing window is already
+visible.
+
+Pass `--allow-multiple` to bypass the check (useful when debugging; it will
+double your polling).
+
 ### Tray support by platform
 
 The tray is real on Windows only. tkinter has no tray support on any platform,
