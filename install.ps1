@@ -11,10 +11,13 @@
     outside your profile.
 
 .PARAMETER Startup
-    Also launch the widget automatically at login, minimized to the tray.
+    Also launch the widget automatically at login, visible.
 
-.PARAMETER StartupVisible
-    With -Startup, show the widget at login instead of starting in the tray.
+.PARAMETER StartupMinimized
+    With -Startup, start in the tray at login instead of showing the window.
+    Note that Windows hides new tray icons in the overflow by default, so the
+    widget may appear not to have started at all. Drag its icon onto the visible
+    part of the tray first.
 
 .PARAMETER NoDesktop
     Skip the Desktop shortcut (Start Menu only).
@@ -31,7 +34,7 @@
 [CmdletBinding()]
 param(
     [switch]$Startup,
-    [switch]$StartupVisible,
+    [switch]$StartupMinimized,
     [switch]$NoDesktop,
     [switch]$Launch,
     [switch]$Uninstall
@@ -168,12 +171,13 @@ New-WidgetShortcut $Shortcuts[1] 'Start Menu'
 if (-not $NoDesktop) { New-WidgetShortcut $Shortcuts[0] 'Desktop' }
 
 if ($Startup) {
-    # Start in the tray at login unless asked otherwise, so it isn't in the way
-    # every time you sign in. The Desktop/Start Menu shortcuts still open it.
-    if ($StartupVisible) {
-        New-WidgetShortcut $Shortcuts[2] 'Startup (visible at login)'
-    } else {
+    # Visible by default. Starting in the tray sounds tidier but Windows hides
+    # new tray icons in the overflow, so it reads as "the widget didn't start" -
+    # which leads to launching it again rather than looking for the icon.
+    if ($StartupMinimized) {
         New-WidgetShortcut $Shortcuts[2] 'Startup (to tray at login)' '--minimized'
+    } else {
+        New-WidgetShortcut $Shortcuts[2] 'Startup (visible at login)'
     }
 } elseif (Test-Path $Shortcuts[2]) {
     Remove-Item $Shortcuts[2] -Force

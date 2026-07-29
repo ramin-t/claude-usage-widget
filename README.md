@@ -26,8 +26,8 @@ outside your profile.
 | | |
 |---|---|
 | `.\install.ps1` | install, no autostart |
-| `.\install.ps1 -Startup` | add launch-at-login, starting in the tray |
-| `.\install.ps1 -Startup -StartupVisible` | launch-at-login, window shown |
+| `.\install.ps1 -Startup` | add launch-at-login, window visible |
+| `.\install.ps1 -Startup -StartupMinimized` | launch-at-login, start in the tray |
 | `.\install.ps1 -NoDesktop` | Start Menu shortcut only |
 | `.\install.ps1 -Uninstall` | remove shortcuts and files |
 
@@ -78,8 +78,11 @@ Hidden bars are remembered by their API `kind` rather than their label, so the
 setting survives the premium model being renamed. Bars you have hidden still
 appear in the menu so you can switch them back on.
 
-With `-Startup`, login launches it straight into the tray. Pass
-`-StartupVisible` alongside it if you'd rather see the window at login.
+With `-Startup`, login launches it visible. `-StartupMinimized` starts it in the
+tray instead — but be aware Windows tucks new tray icons into the `^` overflow,
+so the widget can look like it never started. Drag its icon onto the visible part
+of the tray before relying on that. The first time you minimize, a balloon says
+where the window went, for the same reason.
 
 ### One instance only
 

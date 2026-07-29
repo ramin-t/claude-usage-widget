@@ -560,6 +560,7 @@ class Widget:
         # Submenus must stay referenced or a collected one breaks the cascade.
         self._menus: list = []
         self._tick = self._pick_tick()
+        self._closing = False
 
         root.title("Claude usage")
         root.configure(bg=BG)
@@ -626,6 +627,16 @@ class Widget:
     def minimize(self) -> None:
         if self.tray_ok:
             self.root.withdraw()
+            # Once only: Windows tucks new tray icons into the overflow, so say
+            # where the window went rather than letting it seem to disappear.
+            if not self.state.get("tray_hint_shown"):
+                self.state["tray_hint_shown"] = True
+                self.tray.notify(
+                    "Claude usage widget",
+                    "Still running in the tray. Click the icon to bring it back "
+                    "- it may be under the ^ overflow arrow.",
+                )
+                self._save()
         else:
             # No tray backend: collapse to the title bar instead of hiding, so
             # the widget is always recoverable.
@@ -765,9 +776,11 @@ class Widget:
             "pinned": self.pinned,
             "hidden_bars": sorted(self.hidden),
             "known_bars": [list(pair) for pair in self.known],
+            "tray_hint_shown": bool(self.state.get("tray_hint_shown")),
         })
 
     def quit(self) -> None:
+        self._closing = True
         self.poller.stop()
         self.tray.stop()
         self._save()
@@ -775,8 +788,14 @@ class Widget:
 
     # -- rendering --------------------------------------------------------
     def _on_update(self, payload: dict) -> None:
-        # Poller runs off-thread; hop back onto the tk loop.
-        self.root.after(0, lambda: self._render(payload))
+        # Poller runs off-thread; hop back onto the tk loop. A fetch in flight
+        # when the window goes away would otherwise raise from the poller thread.
+        if self._closing:
+            return
+        try:
+            self.root.after(0, lambda: self._render(payload))
+        except Exception:
+            pass
 
     def _render(self, payload: dict) -> None:
         self._last = payload
@@ -1004,6 +1023,7 @@ WM_APP = 0x8000
 WM_TRAY_CALLBACK = WM_APP + 1
 WM_TRAY_SETTIP = WM_APP + 2
 WM_TRAY_STOP = WM_APP + 3
+WM_TRAY_BALLOON = WM_APP + 4
 
 WM_DESTROY = 0x0002
 WM_LBUTTONUP = 0x0202
@@ -1029,6 +1049,7 @@ class WindowsTray:
         self._ready = threading.Event()
         self._tip_lock = threading.Lock()
         self._pending_tip = tooltip
+        self._pending_balloon: tuple[str, str] | None = None
         self._thread: threading.Thread | None = None
 
     # -- public -----------------------------------------------------------
@@ -1049,6 +1070,18 @@ class WindowsTray:
             self._pending_tip = text[:127]
         try:
             self._user32.PostMessageW(self.hwnd, WM_TRAY_SETTIP, 0, 0)
+        except Exception:
+            pass
+
+    def notify(self, title: str, text: str) -> None:
+        """Show a balloon. Windows hides new tray icons in the overflow, so
+        without this a first minimize looks like the widget just vanished."""
+        if not self.available or not self.hwnd:
+            return
+        with self._tip_lock:
+            self._pending_balloon = (title[:63], text[:255])
+        try:
+            self._user32.PostMessageW(self.hwnd, WM_TRAY_BALLOON, 0, 0)
         except Exception:
             pass
 
@@ -1218,6 +1251,9 @@ class WindowsTray:
             if msg == WM_TRAY_SETTIP:
                 self._apply_tooltip()
                 return 0
+            if msg == WM_TRAY_BALLOON:
+                self._apply_balloon()
+                return 0
             if msg == WM_TRAY_STOP:
                 self._remove_icon()
                 self._user32.DestroyWindow(hwnd)
@@ -1234,6 +1270,23 @@ class WindowsTray:
         with self._tip_lock:
             self._data.szTip = self._pending_tip
         self._shell32.Shell_NotifyIconW(0x01, ctypes.byref(self._data))  # NIM_MODIFY
+
+    def _apply_balloon(self) -> None:
+        ctypes = self._ctypes
+        with self._tip_lock:
+            pending = self._pending_balloon
+            self._pending_balloon = None
+        if not pending:
+            return
+        title, text = pending
+        self._data.uFlags = 0x01 | 0x02 | 0x04 | 0x10  # ...| NIF_INFO
+        self._data.szInfoTitle = title
+        self._data.szInfo = text
+        self._data.dwInfoFlags = 0x01  # NIIF_INFO
+        self._shell32.Shell_NotifyIconW(0x01, ctypes.byref(self._data))  # NIM_MODIFY
+        # Clear NIF_INFO again so later tooltip updates don't re-show the balloon.
+        self._data.uFlags = 0x01 | 0x02 | 0x04
+        self._data.szInfo = ""
 
     def _remove_icon(self) -> None:
         ctypes = self._ctypes
