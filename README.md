@@ -104,6 +104,25 @@ read, in order, from:
 
 If none resolve, the widget says so; run `claude` once to sign in.
 
+The OAuth access token is short-lived (about 8 hours) and Claude Code refreshes
+it when it runs. The widget does **not** refresh it — deliberately, since a
+refresh can rotate the refresh token and racing Claude Code for that risks
+signing you out of both.
+
+Instead it reads the expiry from the credential file and re-checks that file
+every 15 seconds, which costs nothing and sends no request. So:
+
+- an expired token is reported as
+  `token expired - run \`claude\` to refresh`, without wasting a request on a
+  token that cannot work;
+- a token the server rejects with 401 is parked rather than resent, so it
+  doesn't burn quota retrying something that can't succeed;
+- when Claude Code writes a fresh token, the widget notices within ~15 seconds
+  and recovers on its own — no restart, and no waiting out a backoff.
+
+This matters most after a reboot: if the widget starts at login before `claude`
+has run, the token from yesterday may already be expired.
+
 ## Polling
 
 Data comes from `GET https://api.anthropic.com/api/oauth/usage`, the same

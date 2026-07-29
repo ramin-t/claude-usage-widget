@@ -42,6 +42,11 @@ IDLE_MAX_SECONDS = 15 * 60
 # Spread clients out so many widgets don't land on the same second.
 JITTER_FRACTION = 0.1
 
+# How often to re-read the local credential file. Costs nothing and no request
+# is sent, so it can be frequent: this is what makes the widget recover on its
+# own seconds after Claude Code refreshes an expired token.
+CREDENTIAL_CHECK_SECONDS = 15
+
 STALE_AFTER_SECONDS = 60 * 60  # past this, last-known-good stops being shown
 
 STATE_FILE = Path.home() / ".claude-usage-widget.json"
@@ -59,24 +64,40 @@ CRIT = "#d9534f"
 # credentials
 # --------------------------------------------------------------------------
 
-def _from_env() -> str | None:
+# A credential is the token plus, when we can find it, its expiry as a unix
+# timestamp. Knowing the expiry matters: it lets us recognise a stale token
+# without spending a request, and recover the moment Claude Code refreshes it.
+class Credential:
+    __slots__ = ("token", "expires_at")
+
+    def __init__(self, token: str, expires_at: float | None = None) -> None:
+        self.token = token
+        self.expires_at = expires_at
+
+    def expired(self, skew: float = 60.0) -> bool:
+        """True if the token is past expiry, or close enough to be useless."""
+        return self.expires_at is not None and time.time() + skew >= self.expires_at
+
+
+def _from_env() -> Credential | None:
     for var in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN"):
         tok = os.environ.get(var)
         if tok:
-            return tok.strip()
+            # Supplied by hand, so we have no expiry to check.
+            return Credential(tok.strip())
     return None
 
 
-def _from_file() -> str | None:
+def _from_file() -> Credential | None:
     path = Path.home() / ".claude" / ".credentials.json"
     try:
         blob = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    return _dig_token(blob)
+    return _dig_credential(blob)
 
 
-def _from_keychain() -> str | None:
+def _from_keychain() -> Credential | None:
     """macOS stores the credential blob in the login keychain."""
     if platform.system() != "Darwin":
         return None
@@ -90,26 +111,35 @@ def _from_keychain() -> str | None:
     if out.returncode != 0:
         return None
     try:
-        return _dig_token(json.loads(out.stdout))
+        return _dig_credential(json.loads(out.stdout))
     except ValueError:
         return None
 
 
-def _dig_token(blob) -> str | None:
-    """Find an access token anywhere in a nested credential blob."""
+def _dig_credential(blob) -> Credential | None:
+    """Find an access token, and any sibling expiry, in a nested blob."""
     if isinstance(blob, dict):
         for key in ("accessToken", "access_token"):
             val = blob.get(key)
             if isinstance(val, str) and val:
-                return val
+                return Credential(val, _expiry_of(blob))
         for val in blob.values():
-            found = _dig_token(val)
+            found = _dig_credential(val)
             if found:
                 return found
     return None
 
 
-def get_token() -> str | None:
+def _expiry_of(node: dict) -> float | None:
+    for key in ("expiresAt", "expires_at", "expiry"):
+        val = node.get(key)
+        if isinstance(val, (int, float)) and val > 0:
+            # Milliseconds if it's implausibly large for seconds.
+            return val / 1000.0 if val > 1e11 else float(val)
+    return None
+
+
+def get_credential() -> Credential | None:
     return _from_env() or _from_file() or _from_keychain()
 
 
@@ -348,7 +378,14 @@ def bar_color(pct: float, severity: str | None = None) -> str:
 # --------------------------------------------------------------------------
 
 class Poller(threading.Thread):
-    """Background fetch loop with geometric backoff on 429."""
+    """Credential watcher plus a rate-limited fetch loop.
+
+    These are deliberately separate cadences. Checking the credential file is
+    free, so we do it often; hitting the network is not, so it stays on the
+    interval. That way an expired token is spotted without spending a request,
+    and the widget recovers within seconds of Claude Code refreshing it instead
+    of sitting in a backoff it can't see out of.
+    """
 
     daemon = True
 
@@ -360,15 +397,20 @@ class Poller(threading.Thread):
         self._stop = threading.Event()
         self.last_good: list[dict] | None = None
         self.last_good_at: float = 0.0
+        self._next_fetch = 0.0
+        self._seen_token: str | None = None
+        self._rejected_token: str | None = None
 
     def refresh_now(self) -> None:
         self.interval = BASE_POLL_SECONDS
+        self._next_fetch = 0.0
+        self._rejected_token = None  # let a previously-401'd token be retried
         self._wake.set()
 
     def _sleep_for(self) -> float:
         """Jitter the wait so many clients don't sync up on one second."""
-        spread = self.interval * JITTER_FRACTION
-        return max(30.0, self.interval + random.uniform(-spread, spread))
+        spread = CREDENTIAL_CHECK_SECONDS * JITTER_FRACTION
+        return CREDENTIAL_CHECK_SECONDS + random.uniform(-spread, spread)
 
     def stop(self) -> None:
         self._stop.set()
@@ -381,11 +423,38 @@ class Poller(threading.Thread):
             self._wake.clear()
 
     def _tick(self) -> None:
-        token = get_token()
-        if not token:
+        credential = get_credential()
+        if credential is None:
             self.on_update({"error": "Not signed in - run `claude` once to authenticate"})
-            self.interval = MAX_POLL_SECONDS
             return
+
+        # A new token means a refresh happened: retry at once, even mid-backoff.
+        if credential.token != self._seen_token:
+            self._seen_token = credential.token
+            self._rejected_token = None
+            self._next_fetch = 0.0
+
+        if credential.expired():
+            self.on_update(self._stale_payload(
+                "token expired - run `claude` to refresh"
+            ))
+            return
+
+        # Don't spend requests re-sending a token the server already rejected;
+        # wait for it to change. refresh_now() clears this to force a retry.
+        if credential.token == self._rejected_token:
+            self.on_update(self._stale_payload(
+                "auth failed - run `claude` to refresh"
+            ))
+            return
+
+        if time.time() < self._next_fetch:
+            return
+
+        self._fetch(credential)
+
+    def _fetch(self, credential: Credential) -> None:
+        token = credential.token
         try:
             windows = parse_windows(fetch_usage(token))
         except RateLimited as err:
@@ -394,18 +463,25 @@ class Poller(threading.Thread):
                                     MAX_POLL_SECONDS)
             else:
                 self.interval = min(self.interval * 2, MAX_POLL_SECONDS)
+            self._schedule_next()
             self.on_update(self._stale_payload("rate limited"))
             return
-        except AuthFailed as err:
-            self.on_update({"error": f"Auth failed ({err}) - re-run `claude`"})
-            self.interval = MAX_POLL_SECONDS
+        except AuthFailed:
+            # Park this token rather than backing off blindly. The credential
+            # check above will notice the moment a fresh one is written.
+            self._rejected_token = token
+            self.on_update(self._stale_payload(
+                "auth failed - run `claude` to refresh"
+            ))
             return
         except Exception as err:  # network hiccup, malformed body, etc.
             self.interval = min(self.interval * 2, MAX_POLL_SECONDS)
+            self._schedule_next()
             self.on_update(self._stale_payload(str(err) or "fetch failed"))
             return
 
         if not windows:
+            self._schedule_next()
             self.on_update({"error": "No limit data in response - try --probe"})
             return
 
@@ -423,7 +499,11 @@ class Poller(threading.Thread):
 
         self.last_good = windows
         self.last_good_at = time.time()
+        self._schedule_next()
         self.on_update({"windows": windows, "stale": False, "at": self.last_good_at})
+
+    def _schedule_next(self) -> None:
+        self._next_fetch = time.time() + self.interval
 
     def _stale_payload(self, reason: str) -> dict:
         fresh_enough = (
@@ -1088,13 +1168,19 @@ class WindowsTray:
 # --------------------------------------------------------------------------
 
 def probe() -> int:
-    token = get_token()
-    if not token:
+    credential = get_credential()
+    if credential is None:
         print("No OAuth token found. Run `claude` once to sign in, or set "
               "CLAUDE_CODE_OAUTH_TOKEN.", file=sys.stderr)
         return 2
+    if credential.expired():
+        when = credential.expires_at
+        stamp = datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M") if when else "?"
+        print(f"Token expired at {stamp}. Run `claude` once to refresh it.",
+              file=sys.stderr)
+        return 4
     try:
-        payload = fetch_usage(token)
+        payload = fetch_usage(credential.token)
     except RateLimited:
         print("Rate limited (429). Wait a few minutes and retry.", file=sys.stderr)
         return 3
