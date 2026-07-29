@@ -557,10 +557,9 @@ class Widget:
         self.known: list[tuple[str, str]] = [
             (str(k), str(v)) for k, v in (self.state.get("known_bars") or [])
         ]
-        # Menu variables must outlive the popup or tkinter loses the checkmarks.
-        self._bar_vars: dict[str, object] = {}
-        self._pin_var = None
+        # Submenus must stay referenced or a collected one breaks the cascade.
         self._menus: list = []
+        self._tick = self._pick_tick()
 
         root.title("Claude usage")
         root.configure(bg=BG)
@@ -684,36 +683,55 @@ class Widget:
                             activebackground="#333", activeforeground=FG,
                             borderwidth=0)
 
+    def _pick_tick(self) -> str:
+        """Choose a tick glyph the menu font can actually draw."""
+        try:
+            from tkinter import font as tkfont
+            menu_font = tkfont.nametofont("TkMenuFont")
+            tick = menu_font.measure("✓")
+            # A Private Use Area codepoint has no glyph in any real font. If the
+            # tick measures the same, both are rendering as the missing-glyph
+            # box, so fall back to something unambiguously drawable.
+            if tick and tick != menu_font.measure(""):
+                return "✓"
+        except Exception:
+            pass
+        return "*"
+
+    def _mark(self, text: str, on: bool | None = None) -> str:
+        """Put toggle state in the label rather than the indicator.
+
+        Tk's checkbutton indicator takes its colour from `selectColor`, which is
+        unset by default and resolves to something invisible against a dark menu
+        background. Drawing the tick ourselves is legible on every platform and
+        theme. `on=None` means "not a toggle", indented to share the gutter.
+        """
+        return (f"{self._tick}  " if on else "    ") + text
+
     def _menu(self, event) -> None:
         menu = self._new_menu(self.root)
-        menu.add_command(label="Refresh now", command=self.poller.refresh_now)
+        menu.add_command(label=self._mark("Refresh now"),
+                         command=self.poller.refresh_now)
         menu.add_command(
-            label="Minimize to tray" if self.tray_ok else "Collapse",
+            label=self._mark("Minimize to tray" if self.tray_ok else "Collapse"),
             command=self.minimize,
         )
 
         bars = self._new_menu(menu)
         for key, label in self.known:
-            var = self._bar_vars.get(key)
-            if var is None:
-                var = self.tk.IntVar()
-                self._bar_vars[key] = var
-            var.set(0 if key in self.hidden else 1)
-            bars.add_checkbutton(label=label, variable=var, onvalue=1, offvalue=0,
-                                 command=lambda k=key: self._toggle_bar(k))
+            bars.add_command(label=self._mark(label, key not in self.hidden),
+                             command=lambda k=key: self._toggle_bar(k))
         if self.hidden:
             bars.add_separator()
-            bars.add_command(label="Show all", command=self._show_all_bars)
-        menu.add_cascade(label="Bars", menu=bars,
+            bars.add_command(label=self._mark("Show all"),
+                             command=self._show_all_bars)
+        menu.add_cascade(label=self._mark("Bars"), menu=bars,
                          state="normal" if self.known else "disabled")
 
-        if self._pin_var is None:
-            self._pin_var = self.tk.IntVar()
-        self._pin_var.set(int(self.pinned))
-        menu.add_checkbutton(label="Always on top", command=self.toggle_pin,
-                             onvalue=1, offvalue=0, variable=self._pin_var)
+        menu.add_command(label=self._mark("Always on top", self.pinned),
+                         command=self.toggle_pin)
         menu.add_separator()
-        menu.add_command(label="Quit", command=self.quit)
+        menu.add_command(label=self._mark("Quit"), command=self.quit)
 
         # Keep the menus referenced; a collected submenu breaks the cascade.
         self._menus = [menu, bars]
