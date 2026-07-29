@@ -68,8 +68,15 @@ window.
 - **–** minimizes to the system tray. Click the tray icon to bring it back;
   right-click it for show / refresh / quit. Hovering the tray icon shows a
   summary (`5h 12%  Week 34%  Fable 8%  Credits 0%`) without restoring.
-- **Right-click** the widget for refresh / minimize / always-on-top / quit.
+- **Right-click** the widget for refresh / minimize / bars / always-on-top / quit.
+- **Right-click › Bars** toggles each bar individually. The widget shrinks to fit
+  whatever is left, and the tray tooltip shows only the bars you kept. Choices
+  persist, and **Show all** brings everything back.
 - **✕** to close.
+
+Hidden bars are remembered by their API `kind` rather than their label, so the
+setting survives the premium model being renamed. Bars you have hidden still
+appear in the menu so you can switch them back on.
 
 With `-Startup`, login launches it straight into the tray. Pass
 `-StartupVisible` alongside it if you'd rather see the window at login.

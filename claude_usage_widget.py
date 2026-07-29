@@ -549,6 +549,19 @@ class Widget:
         self._last: dict | None = None
         self.pinned = bool(self.state.get("pinned", True))
 
+        # Bars hidden by the user, held by `kind` key rather than label so the
+        # setting survives a display-name change (e.g. the premium model being
+        # renamed). `known` remembers every bar we have seen so a hidden one can
+        # still be listed in the menu and turned back on.
+        self.hidden: set[str] = set(self.state.get("hidden_bars") or [])
+        self.known: list[tuple[str, str]] = [
+            (str(k), str(v)) for k, v in (self.state.get("known_bars") or [])
+        ]
+        # Menu variables must outlive the popup or tkinter loses the checkmarks.
+        self._bar_vars: dict[str, object] = {}
+        self._pin_var = None
+        self._menus: list = []
+
         root.title("Claude usage")
         root.configure(bg=BG)
         root.overrideredirect(True)
@@ -589,6 +602,7 @@ class Widget:
         for target in (self.frame, header, title, self.body, self.status):
             target.bind("<Button-1>", self._drag_start)
             target.bind("<B1-Motion>", self._drag_move)
+            target.bind("<ButtonRelease-1>", self._drag_end)
             target.bind("<Button-3>", self._menu)
 
         self.poller = Poller(self._on_update)
@@ -650,39 +664,95 @@ class Widget:
     def _drag_start(self, event) -> None:
         self._ox, self._oy = event.x_root, event.y_root
         self._wx, self._wy = self.root.winfo_x(), self.root.winfo_y()
+        self._moved = False
 
     def _drag_move(self, event) -> None:
         x = self._wx + (event.x_root - self._ox)
         y = self._wy + (event.y_root - self._oy)
         self.root.geometry(f"+{x}+{y}")
+        self._moved = True
 
-    def _menu(self, event) -> None:
-        menu = self.tk.Menu(self.root, tearoff=0, bg=BG, fg=FG,
+    def _drag_end(self, _event) -> None:
+        # Save on release rather than only at quit, so the position survives the
+        # process being killed rather than closed.
+        if getattr(self, "_moved", False):
+            self._moved = False
+            self._save()
+
+    def _new_menu(self, parent):
+        return self.tk.Menu(parent, tearoff=0, bg=BG, fg=FG,
                             activebackground="#333", activeforeground=FG,
                             borderwidth=0)
+
+    def _menu(self, event) -> None:
+        menu = self._new_menu(self.root)
         menu.add_command(label="Refresh now", command=self.poller.refresh_now)
         menu.add_command(
             label="Minimize to tray" if self.tray_ok else "Collapse",
             command=self.minimize,
         )
+
+        bars = self._new_menu(menu)
+        for key, label in self.known:
+            var = self._bar_vars.get(key)
+            if var is None:
+                var = self.tk.IntVar()
+                self._bar_vars[key] = var
+            var.set(0 if key in self.hidden else 1)
+            bars.add_checkbutton(label=label, variable=var, onvalue=1, offvalue=0,
+                                 command=lambda k=key: self._toggle_bar(k))
+        if self.hidden:
+            bars.add_separator()
+            bars.add_command(label="Show all", command=self._show_all_bars)
+        menu.add_cascade(label="Bars", menu=bars,
+                         state="normal" if self.known else "disabled")
+
+        if self._pin_var is None:
+            self._pin_var = self.tk.IntVar()
+        self._pin_var.set(int(self.pinned))
         menu.add_checkbutton(label="Always on top", command=self.toggle_pin,
-                             onvalue=1, offvalue=0,
-                             variable=self.tk.IntVar(value=int(self.pinned)))
+                             onvalue=1, offvalue=0, variable=self._pin_var)
         menu.add_separator()
         menu.add_command(label="Quit", command=self.quit)
+
+        # Keep the menus referenced; a collected submenu breaks the cascade.
+        self._menus = [menu, bars]
         menu.tk_popup(event.x_root, event.y_root)
+
+    def _toggle_bar(self, key: str) -> None:
+        self.hidden.symmetric_difference_update({key})
+        if self._last:
+            self._render(self._last)
+        self._save()
+
+    def _show_all_bars(self) -> None:
+        self.hidden.clear()
+        if self._last:
+            self._render(self._last)
+        self._save()
 
     def toggle_pin(self) -> None:
         self.pinned = not self.pinned
         self.root.attributes("-topmost", self.pinned)
+        self._save()
+
+    def _save(self) -> None:
+        # Written on every change, not just at quit, so settings survive a kill.
+        try:
+            position = f"+{self.root.winfo_x()}+{self.root.winfo_y()}"
+        except Exception:
+            position = self.state.get("geometry")
+        save_state({
+            "geometry": position,
+            "pinned": self.pinned,
+            "hidden_bars": sorted(self.hidden),
+            "known_bars": [list(pair) for pair in self.known],
+        })
 
     def quit(self) -> None:
         self.poller.stop()
         self.tray.stop()
-        save_state({
-            "geometry": f"+{self.root.winfo_x()}+{self.root.winfo_y()}",
-            "pinned": self.pinned,
-        })
+        self._save()
         self.root.destroy()
 
     # -- rendering --------------------------------------------------------
@@ -698,17 +768,32 @@ class Widget:
             self.tray.set_tooltip(f"Claude usage\n{payload['error']}"[:127])
             return
 
+        # Remember every bar the API reports, so hidden ones stay listed in the
+        # menu and can be switched back on.
+        seen = {k for k, _ in self.known}
         for win in payload["windows"]:
+            if win["key"] not in seen:
+                self.known.append((win["key"], win["label"]))
+                seen.add(win["key"])
+
+        visible = [w for w in payload["windows"] if w["key"] not in self.hidden]
+        for win in visible:
             self._row(win)
 
-        # Drop rows the API stopped reporting.
-        live = {w["label"] for w in payload["windows"]}
+        # Drop rows that are hidden, or that the API stopped reporting.
+        live = {w["label"] for w in visible}
         for label in [k for k in self.rows if k not in live]:
             self.rows.pop(label)["frame"].destroy()
 
+        # The tooltip is the compact view, so it honours the same hiding. If
+        # everything is hidden it falls back to the full set rather than nothing.
         self.tray.set_tooltip(
-            tooltip_text(payload["windows"], bool(payload.get("stale")))
+            tooltip_text(visible or payload["windows"], bool(payload.get("stale")))
         )
+
+        if not visible and payload["windows"]:
+            self.status.config(text="all bars hidden - right-click › Bars", fg=DIM)
+            return
 
         when = time.strftime("%H:%M", time.localtime(payload["at"]))
         if payload.get("stale"):
@@ -746,6 +831,7 @@ class Widget:
             for target in (frame, top, name, pct, track, reset):
                 target.bind("<Button-1>", self._drag_start)
                 target.bind("<B1-Motion>", self._drag_move)
+                target.bind("<ButtonRelease-1>", self._drag_end)
                 target.bind("<Button-3>", self._menu)
 
         value = win["percent"]
