@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,6 +48,10 @@ JITTER_FRACTION = 0.1
 # own seconds after Claude Code refreshes an expired token.
 CREDENTIAL_CHECK_SECONDS = 15
 
+# Whether to attempt an OAuth refresh when the token has expired. Disable with
+# --no-refresh to leave the credential file strictly read-only.
+ALLOW_REFRESH = True
+
 STALE_AFTER_SECONDS = 60 * 60  # past this, last-known-good stops being shown
 
 STATE_FILE = Path.home() / ".claude-usage-widget.json"
@@ -68,11 +73,26 @@ CRIT = "#d9534f"
 # timestamp. Knowing the expiry matters: it lets us recognise a stale token
 # without spending a request, and recover the moment Claude Code refreshes it.
 class Credential:
-    __slots__ = ("token", "expires_at")
+    __slots__ = ("token", "expires_at", "refresh_token", "source", "path",
+                 "container", "keys", "persisted")
 
-    def __init__(self, token: str, expires_at: float | None = None) -> None:
+    def __init__(self, token: str, expires_at: float | None = None,
+                 refresh_token: str | None = None, source: str = "env",
+                 path: "Path | None" = None,
+                 container: tuple[str, ...] = (), keys: dict | None = None) -> None:
         self.token = token
         self.expires_at = expires_at
+        self.refresh_token = refresh_token
+        self.source = source          # env | file | keychain
+        self.path = path              # file we can write a rotated token back to
+        self.container = container    # key path to the dict holding the token
+        self.keys = keys or {}        # the exact field names found there
+        self.persisted = True         # False if a refresh could not be saved
+
+    def refreshable(self) -> bool:
+        # Only when we can write a rotated refresh token back. Refreshing without
+        # persisting would hand Claude Code a dead credential.
+        return bool(self.refresh_token and self.source == "file" and self.path)
 
     def expired(self, skew: float = 60.0) -> bool:
         """True if the token is past expiry, or close enough to be useless."""
@@ -94,7 +114,11 @@ def _from_file() -> Credential | None:
         blob = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    return _dig_credential(blob)
+    found = _dig_credential(blob)
+    if found:
+        found.source = "file"
+        found.path = path
+    return found
 
 
 def _from_keychain() -> Credential | None:
@@ -116,15 +140,40 @@ def _from_keychain() -> Credential | None:
         return None
 
 
-def _dig_credential(blob) -> Credential | None:
-    """Find an access token, and any sibling expiry, in a nested blob."""
+def _dig_credential(blob, container: tuple[str, ...] = ()) -> Credential | None:
+    """Find an access token, its sibling expiry and refresh token, in a blob.
+
+    Records where it was found and under exactly which field names, so a
+    refreshed token can be written back into the same place without assuming a
+    particular layout.
+    """
     if isinstance(blob, dict):
         for key in ("accessToken", "access_token"):
             val = blob.get(key)
             if isinstance(val, str) and val:
-                return Credential(val, _expiry_of(blob))
-        for val in blob.values():
-            found = _dig_credential(val)
+                refresh_key = next(
+                    (k for k in ("refreshToken", "refresh_token") if blob.get(k)), None
+                )
+                expiry_key = next(
+                    (k for k in ("expiresAt", "expires_at", "expiry")
+                     if isinstance(blob.get(k), (int, float))), None
+                )
+                raw_expiry = blob.get(expiry_key) if expiry_key else None
+                return Credential(
+                    val,
+                    _expiry_of(blob),
+                    blob.get(refresh_key) if refresh_key else None,
+                    container=container,
+                    keys={
+                        "access": key,
+                        "refresh": refresh_key,
+                        "expiry": expiry_key,
+                        # Preserve the unit so we write back what was there.
+                        "expiry_ms": bool(raw_expiry and raw_expiry > 1e11),
+                    },
+                )
+        for name, val in blob.items():
+            found = _dig_credential(val, container + (name,))
             if found:
                 return found
     return None
@@ -141,6 +190,133 @@ def _expiry_of(node: dict) -> float | None:
 
 def get_credential() -> Credential | None:
     return _from_env() or _from_file() or _from_keychain()
+
+
+# --------------------------------------------------------------------------
+# token refresh
+#
+# The same flow Claude Code uses. Two things make this delicate:
+#
+#  - The server may return a NEW refresh token, retiring the one we sent. If we
+#    fail to save it, Claude Code is left holding a dead credential. So we only
+#    refresh when we can write back, and we report it loudly if the write fails.
+#  - We share the file with Claude Code, so the write is atomic (temp +
+#    os.replace) and merges into a fresh read rather than overwriting wholesale.
+# --------------------------------------------------------------------------
+
+REFRESH_URL = "https://platform.claude.com/v1/oauth/token"
+CLAUDE_CODE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+
+def _post_token(payload: dict, as_json: bool) -> dict:
+    if as_json:
+        body, content_type = json.dumps(payload).encode(), "application/json"
+    else:
+        body = urllib.parse.urlencode(payload).encode()
+        content_type = "application/x-www-form-urlencoded"
+    req = urllib.request.Request(
+        REFRESH_URL, data=body, method="POST",
+        headers={
+            "Content-Type": content_type,
+            "Accept": "application/json",
+            "User-Agent": "claude-usage-widget/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def refresh_credential(credential: Credential) -> Credential | None:
+    """One refresh attempt. Returns the new credential, or None on failure."""
+    if not credential.refreshable():
+        return None
+    payload = {
+        "grant_type": "refresh_token",
+        "refresh_token": credential.refresh_token,
+        "client_id": CLAUDE_CODE_CLIENT_ID,
+    }
+    try:
+        data = _post_token(payload, as_json=True)
+    except urllib.error.HTTPError as err:
+        detail = ""
+        try:
+            detail = err.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        # A complaint about the request shape means the grant was not consumed,
+        # so one retry with form encoding is safe. invalid_grant means the token
+        # is spent or revoked - retrying would be pointless and confusing.
+        if err.code in (400, 415) and "invalid_grant" not in detail:
+            try:
+                data = _post_token(payload, as_json=False)
+            except Exception:
+                return None
+        else:
+            return None
+    except Exception:
+        return None
+
+    access = data.get("access_token")
+    if not isinstance(access, str) or not access:
+        return None
+    rotated = data.get("refresh_token")
+    new_refresh = rotated if isinstance(rotated, str) and rotated else credential.refresh_token
+    lifetime = data.get("expires_in")
+    expires_at = (
+        time.time() + float(lifetime) if isinstance(lifetime, (int, float)) else None
+    )
+
+    fresh = Credential(access, expires_at, new_refresh, "file", credential.path,
+                       credential.container, dict(credential.keys))
+    fresh.persisted = _write_back(fresh)
+    return fresh
+
+
+def _write_back(credential: Credential) -> bool:
+    """Merge the new token into the credential file atomically."""
+    path = credential.path
+    if path is None:
+        return False
+    try:
+        blob = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+
+    node = blob
+    for key in credential.container:
+        if not isinstance(node, dict) or key not in node:
+            return False
+        node = node[key]
+    if not isinstance(node, dict):
+        return False
+
+    keys = credential.keys
+    node[keys.get("access") or "accessToken"] = credential.token
+    if keys.get("refresh") and credential.refresh_token:
+        node[keys["refresh"]] = credential.refresh_token
+    if credential.expires_at is not None:
+        field = keys.get("expiry") or "expiresAt"
+        node[field] = (
+            int(credential.expires_at * 1000) if keys.get("expiry_ms")
+            else int(credential.expires_at)
+        )
+
+    # Atomic: a crash mid-write must not leave a truncated credential file.
+    temp = path.with_name(path.name + ".widget-tmp")
+    try:
+        temp.write_text(json.dumps(blob, indent=2), encoding="utf-8")
+        try:
+            os.chmod(temp, 0o600)
+        except OSError:
+            pass  # Windows ignores POSIX modes
+        os.replace(temp, path)
+        return True
+    except OSError:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -400,6 +576,10 @@ class Poller(threading.Thread):
         self._next_fetch = 0.0
         self._seen_token: str | None = None
         self._rejected_token: str | None = None
+        # Refresh tokens we have already spent an attempt on. One try each, so a
+        # revoked token doesn't turn into a retry loop against the auth server.
+        self._refresh_attempted: set[str] = set()
+        self._save_failed = False
 
     def refresh_now(self) -> None:
         self.interval = BASE_POLL_SECONDS
@@ -435,10 +615,13 @@ class Poller(threading.Thread):
             self._next_fetch = 0.0
 
         if credential.expired():
-            self.on_update(self._stale_payload(
-                "token expired - run `claude` to refresh"
-            ))
-            return
+            renewed = self._try_refresh(credential)
+            if renewed is None:
+                self.on_update(self._stale_payload(
+                    "token expired - run `claude` to refresh"
+                ))
+                return
+            credential = renewed
 
         # Don't spend requests re-sending a token the server already rejected;
         # wait for it to change. refresh_now() clears this to force a retry.
@@ -452,6 +635,28 @@ class Poller(threading.Thread):
             return
 
         self._fetch(credential)
+
+    def _try_refresh(self, credential: Credential) -> Credential | None:
+        """A single refresh attempt per refresh token."""
+        if not ALLOW_REFRESH or not credential.refreshable():
+            return None
+        token = credential.refresh_token or ""
+        if token in self._refresh_attempted:
+            return None
+        self._refresh_attempted.add(token)
+
+        renewed = refresh_credential(credential)
+        if renewed is None:
+            return None
+
+        self._seen_token = renewed.token
+        self._rejected_token = None
+        self._next_fetch = 0.0
+        if not renewed.persisted:
+            # The token works for us, but Claude Code may now hold a retired
+            # refresh token. Say so rather than let it fail silently later.
+            self._save_failed = True
+        return renewed
 
     def _fetch(self, credential: Credential) -> None:
         token = credential.token
@@ -467,6 +672,12 @@ class Poller(threading.Thread):
             self.on_update(self._stale_payload("rate limited"))
             return
         except AuthFailed:
+            # A 401 on a token that looked valid means the expiry was wrong or
+            # the token was revoked server-side, so try a refresh here too.
+            renewed = self._try_refresh(credential)
+            if renewed is not None:
+                self._fetch(renewed)
+                return
             # Park this token rather than backing off blindly. The credential
             # check above will notice the moment a fresh one is written.
             self._rejected_token = token
@@ -500,7 +711,10 @@ class Poller(threading.Thread):
         self.last_good = windows
         self.last_good_at = time.time()
         self._schedule_next()
-        self.on_update({"windows": windows, "stale": False, "at": self.last_good_at})
+        payload = {"windows": windows, "stale": False, "at": self.last_good_at}
+        if self._save_failed:
+            payload["warn"] = "refreshed but could not save - run `claude`"
+        self.on_update(payload)
 
     def _schedule_next(self) -> None:
         self._next_fetch = time.time() + self.interval
@@ -833,6 +1047,9 @@ class Widget:
             return
 
         when = time.strftime("%H:%M", time.localtime(payload["at"]))
+        if payload.get("warn"):
+            self.status.config(text=payload["warn"], fg=WARN)
+            return
         if payload.get("stale"):
             self.status.config(
                 text=f"last known {when} · {payload.get('note', 'stale')}",
@@ -1454,6 +1671,9 @@ def probe() -> int:
 
 
 def main() -> int:
+    global ALLOW_REFRESH
+    if "--no-refresh" in sys.argv:
+        ALLOW_REFRESH = False
     if "--probe" in sys.argv:
         return probe()
     if "--make-icon" in sys.argv:

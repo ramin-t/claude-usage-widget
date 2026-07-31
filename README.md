@@ -131,16 +131,35 @@ read, in order, from:
 If none resolve, the widget says so; run `claude` once to sign in.
 
 The OAuth access token is short-lived (about 8 hours) and Claude Code refreshes
-it when it runs. The widget does **not** refresh it — deliberately, since a
-refresh can rotate the refresh token and racing Claude Code for that risks
-signing you out of both.
+it when it runs. If the widget finds an expired token it makes **one** refresh
+attempt itself, using the same flow Claude Code uses, so a machine left overnight
+comes back working without you having to run `claude` first.
 
-Instead it reads the expiry from the credential file and re-checks that file
-every 15 seconds, which costs nothing and sends no request. So:
+That refresh can rotate the refresh token, which makes saving the result
+mandatory — a rotated token we failed to persist would leave Claude Code holding
+a dead credential. So:
 
-- an expired token is reported as
-  `token expired - run \`claude\` to refresh`, without wasting a request on a
-  token that cannot work;
+- the widget only refreshes when it can write back, i.e. when the credential
+  came from the file. Tokens from `CLAUDE_CODE_OAUTH_TOKEN` or the macOS keychain
+  are used as-is and never refreshed;
+- the write is atomic (temp file + `os.replace`) and merges into a fresh read, so
+  sharing the file with Claude Code cannot truncate it, and unrelated fields
+  (`scopes`, `subscriptionType`, …) are preserved untouched;
+- the original epoch unit is preserved, milliseconds or seconds;
+- exactly **one** attempt is made per refresh token. A revoked token yields
+  `invalid_grant`, which is not retried, so it cannot become a retry loop;
+- if the refresh works but the write fails, the status line says
+  `refreshed but could not save - run \`claude\`` rather than letting Claude Code
+  fail mysteriously later.
+
+`--no-refresh` disables this entirely and keeps the credential file read-only.
+
+It also still reads the expiry from the file and re-checks it every 15 seconds,
+which costs nothing and sends no request. So:
+
+- an expired token that could not be refreshed is reported as
+  `token expired - run \`claude\` to refresh`, without wasting a usage request on
+  a token that cannot work;
 - a token the server rejects with 401 is parked rather than resent, so it
   doesn't burn quota retrying something that can't succeed;
 - when Claude Code writes a fresh token, the widget notices within ~15 seconds
